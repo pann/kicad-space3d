@@ -1,291 +1,319 @@
 """
-SpaceMouse KiCad Plugin
-=======================
-Reads 6DOF events from spacenavd's Unix socket and applies them
-directly to the KiCad PCB editor view — no keypresses, no window
-focus tricks.
+SpaceMouse KiCad Plugin (KiCad 9)
+=================================
+Reads 6DOF events from spacenavd's Unix socket and drives the PCB editor
+canvas via synthesized wx events:
 
-Controls (SpaceExplorer axes):
-  TX  push left/right  → pan X
-  TY  push fwd/back    → pan Y
-  TZ  pull/push down   → zoom in/out
-  RZ  twist CW/CCW     → zoom (alternative, disabled by default)
+  - TX / TY  → continuous middle-mouse-drag (pan)
+  - TZ       → mouse-wheel notches         (zoom)
 
-  Button 0 (left)      → Zoom to fit board
-  Button 1 (right)     → Zoom to fit selection (or board if nothing selected)
+KiCad 9 stripped the Python wrappers for PCB_EDIT_FRAME, so we can no
+longer call view.SetCenter() / SetScale() from Python. Event synthesis
+into the wxGLCanvas is the only path that works, but the events are
+processed by KiCad's own C++ input handlers — pan/zoom behaviour is
+exactly what real input would produce.
 
-Install:
-  cp -r spacemouse_kicad ~/.local/share/kicad/8.0/scripting/plugins/
-  (or whatever your KiCad version/path is — check with:
-   pcbnew scripting console → import pcbnew; print(pcbnew.PLUGIN_DIRECTORIES_SEARCH) )
-
-Auto-start:
-  Add this line to ~/.config/kicad/8.0/scripting/startup.py  (create if missing):
-    import spacemouse_kicad
-
-Usage:
-  Tools → External Plugins → SpaceMouse  (toggles on/off)
-  Or auto-starts via startup.py (see above)
+Threading model:
+  - Reader thread: blocks on spacenavd socket, updates a single shared
+    snapshot under a lock. Never touches wx.
+  - wx.Timer on UI thread: every UI_TICK_MS, reads the snapshot and
+    posts the appropriate events to the canvas. All wx work stays on
+    the UI thread (which is required).
 """
 
-import threading
-import struct
-import socket
-import time
 import os
+import socket
+import struct
+import threading
+import time
 
+import wx
 import pcbnew
 
-# ── Tuning ──────────────────────────────────────────────────────────────────
 
-SPNAV_SOCK     = "/var/run/spnav.sock"
+# === Tuning ==================================================================
 
-# Axis deadzone — raw spacenavd units, ~32000 max travel
-# Increase if you get drift when puck is released
-DEADZONE       = 600
+SPNAV_SOCK = "/var/run/spnav.sock"
 
-# How strongly TX/TY move the view per event (in KiCad internal units = nm)
-# pcbnew works in nanometres internally; 1 mm = 1_000_000 nm
-# ~2mm per strong push feels natural — tune to taste
-PAN_SCALE      = 0.00015    # multiplied by raw axis value → nm offset
+# Raw axis values are ~int32, typical strong push ≈ ±2000.
+# Anything below this is treated as zero (drift filter).
+DEADZONE = 600
 
-# Zoom scale factor per event. 1.0 = no change, >1 = zoom in
-# Applied proportionally to axis deflection
-ZOOM_SCALE     = 0.000003   # multiplied by raw axis value → zoom ratio delta
+# Pan scale: spacenavd unit → canvas pixels per UI tick.
+# A strong push (~2000) should give a few tens of pixels per tick.
+PAN_SCALE = 0.02
 
-# Event loop rate — 60Hz is plenty, keeps CPU negligible
-LOOP_HZ        = 60
-LOOP_SLEEP     = 1.0 / LOOP_HZ
+# Zoom scale: spacenavd unit → wheel notches per UI tick (before clamp).
+# 1 notch ≈ KiCad's per-wheel zoom step (~30%).
+ZOOM_SCALE = 0.0008
 
-# ── Plugin class ─────────────────────────────────────────────────────────────
+# Clamp how many wheel notches we synthesize per tick — prevents wild
+# zoom jumps if the user slams the cap.
+MAX_WHEEL_NOTCHES_PER_TICK = 3
+
+# UI tick interval (milliseconds). 16 ≈ 60Hz.
+UI_TICK_MS = 16
+
+# If we haven't seen a spacenavd event in this long, treat the puck as
+# centered (defensive against the daemon going quiet while the puck is
+# still deflected).
+EVENT_STALE_S = 0.2
+
+
+# === ActionPlugin shell ======================================================
 
 class SpaceMousePlugin(pcbnew.ActionPlugin):
 
     def defaults(self):
-        self.name             = "SpaceMouse"
-        self.category         = "Navigation"
-        self.description      = "Toggle SpaceMouse 6DOF navigation (via spacenavd)"
+        self.name = "SpaceMouse"
+        self.category = "Navigation"
+        self.description = "Toggle SpaceMouse 6DOF navigation (via spacenavd)"
         self.show_toolbar_button = True
-        self.icon_file_name   = os.path.join(os.path.dirname(__file__), "icon.png")
+        self.icon_file_name = os.path.join(os.path.dirname(__file__), "icon.png")
 
     def Run(self):
-        """Called when user clicks the plugin. Toggles the listener thread."""
         _manager.toggle()
 
 
-# ── Background listener ───────────────────────────────────────────────────────
+# === Manager =================================================================
 
-class SpaceMouseManager:
+class _Manager:
     """
-    Singleton that owns the reader thread.
-    The thread reads from the spacenavd Unix socket and applies
-    view transforms directly via pcbnew's Python API.
+    Owns the reader thread, the wx UI timer, and the synthetic-drag state.
     """
 
     def __init__(self):
-        self._thread   = None
+        # Reader thread state
+        self._reader_thread = None
         self._stop_evt = threading.Event()
-        self._running  = False
+        self._lock = threading.Lock()
+        self._latest = (0, 0, 0, 0)           # tx, ty, tz, buttons
+        self._latest_t = 0.0                  # monotonic time of last update
+
+        # UI thread state (only touched on UI thread)
+        self._timer = None
+        self._canvas = None
+        self._frame = None
+        self._panning = False
+        self._cursor_x = 0
+        self._cursor_y = 0
+
+        self._running = False
+
+    # ── Public toggle ────────────────────────────────────────────────────────
 
     def toggle(self):
         if self._running:
             self.stop()
             _status("SpaceMouse stopped")
         else:
-            ok = self.start()
-            if ok:
-                _status("SpaceMouse active — puck ready")
-            else:
-                _status(f"SpaceMouse ERROR: cannot connect to {SPNAV_SOCK} — is spacenavd running?")
+            ok, reason = self.start()
+            _status("SpaceMouse active" if ok else f"SpaceMouse ERROR: {reason}")
 
     def start(self):
+        if self._running:
+            return True, "already running"
         if not os.path.exists(SPNAV_SOCK):
-            return False
+            return False, f"spacenavd socket not found at {SPNAV_SOCK}"
+
+        canvas, frame = _find_pcb_canvas()
+        if canvas is None:
+            return False, "PCB Editor window not found — open it and try again"
+
+        self._canvas = canvas
+        self._frame = frame
+
+        # Reader thread
         self._stop_evt.clear()
-        self._thread = threading.Thread(
-            target=self._reader_loop,
-            name="SpaceMouseReader",
-            daemon=True
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, name="SpaceMouseReader", daemon=True
         )
-        self._thread.start()
+        self._reader_thread.start()
+
+        # UI timer — must be created on UI thread; Run()/auto_start() are
+        # both invoked there.
+        self._timer = wx.Timer()
+        self._timer.Bind(wx.EVT_TIMER, self._on_tick)
+        self._timer.Start(UI_TICK_MS)
+
         self._running = True
-        return True
+        return True, ""
 
     def stop(self):
-        self._stop_evt.set()
-        if self._thread:
-            self._thread.join(timeout=1.0)
+        if not self._running:
+            return
         self._running = False
+        self._stop_evt.set()
 
-    # ── Reader thread ─────────────────────────────────────────────────────────
+        if self._timer is not None:
+            self._timer.Stop()
+            self._timer = None
+
+        if self._panning:
+            self._end_pan()
+
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=1.0)
+            self._reader_thread = None
+
+    # ── Reader thread ────────────────────────────────────────────────────────
 
     def _reader_loop(self):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             sock.connect(SPNAV_SOCK)
-            sock.settimeout(0.1)
+            sock.settimeout(0.5)
         except OSError as e:
-            print(f"[SpaceMouse] Failed to connect: {e}")
-            self._running = False
+            print(f"[SpaceMouse] reader connect failed: {e}")
             return
 
-        print("[SpaceMouse] Connected to spacenavd")
+        print("[SpaceMouse] reader connected")
         buf = b""
 
         while not self._stop_evt.is_set():
             try:
-                chunk = sock.recv(64)
-                if chunk:
-                    buf += chunk
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
             except socket.timeout:
-                pass
+                continue
             except OSError:
                 break
 
-            # Process all complete 32-byte packets in the buffer
             while len(buf) >= 32:
                 packet, buf = buf[:32], buf[32:]
-                self._handle_packet(packet)
-
-            time.sleep(LOOP_SLEEP)
+                vals = struct.unpack("<8i", packet)
+                with self._lock:
+                    self._latest = (vals[0], vals[1], vals[2], vals[7])
+                    self._latest_t = time.monotonic()
 
         sock.close()
-        print("[SpaceMouse] Disconnected from spacenavd")
+        print("[SpaceMouse] reader disconnected")
 
-    def _handle_packet(self, data):
-        """
-        spacenavd sends 32-byte packets.
-        Layout: 8 × int32 (little-endian)
-          [0] TX  [1] TY  [2] TZ  (translation)
-          [3] pad
-          [4] RX  [5] RY  [6] RZ  (rotation)
-          [7] buttons bitmask
-        Values are signed, roughly ±32000 at full deflection.
-        """
-        vals = struct.unpack('<8i', data)
-        tx, ty, tz = vals[0], vals[1], vals[2]
-        rx, ry, rz = vals[4], vals[5], vals[6]
-        buttons    = vals[7]
+    # ── UI tick (UI thread) ──────────────────────────────────────────────────
 
-        self._apply_view(tx, ty, tz, buttons)
+    def _on_tick(self, _evt):
+        # Snapshot the latest puck state under the lock.
+        with self._lock:
+            tx, ty, tz, _buttons = self._latest
+            age = time.monotonic() - self._latest_t
 
-    def _apply_view(self, tx, ty, tz, buttons):
-        """
-        Manipulate the KiCad PCB editor view.
-        All operations run on the reader thread — pcbnew's Python
-        bindings are generally thread-safe for view operations.
-        """
-        try:
-            frame = pcbnew.GetCurrentFrame()
-            if frame is None:
-                return
+        # Stale → treat as centered.
+        if age > EVENT_STALE_S:
+            tx = ty = tz = 0
 
-            view = frame.GetCanvas().GetView()
+        # Deadzone.
+        if abs(tx) < DEADZONE: tx = 0
+        if abs(ty) < DEADZONE: ty = 0
+        if abs(tz) < DEADZONE: tz = 0
 
-            # ── Buttons ───────────────────────────────────────────────────────
-            # Processed first so a button press doesn't also pan/zoom
+        # If the canvas has been destroyed (e.g. PCB editor closed) bail.
+        if self._canvas is None or not self._canvas:
+            self.stop()
+            return
 
-            if buttons & 0x01:   # Left button → fit board
-                wx_evt = None
-                pcbnew.CallAfter(frame.ToTheTop)  # bring to front
-                pcbnew.CallAfter(lambda: _zoom_fit(frame))
-                return
+        # ── Pan via middle-drag state machine ──
+        if tx or ty:
+            dx = int(tx * PAN_SCALE)
+            dy = int(-ty * PAN_SCALE)   # invert: pushing puck forward pans up
+            self._continue_pan(dx, dy)
+        elif self._panning:
+            self._end_pan()
 
-            if buttons & 0x02:   # Right button → fit selection or board
-                pcbnew.CallAfter(lambda: _zoom_fit_selection(frame))
-                return
+        # ── Zoom via wheel notches ──
+        if tz:
+            # Pull cap up (tz < 0) → zoom in (positive wheel rotation).
+            notches = int(-tz * ZOOM_SCALE)
+            notches = max(-MAX_WHEEL_NOTCHES_PER_TICK,
+                          min(MAX_WHEEL_NOTCHES_PER_TICK, notches))
+            if notches:
+                self._send_wheel(notches)
 
-            # ── Translation: TX / TY → pan ────────────────────────────────────
+    # ── Synthetic events ─────────────────────────────────────────────────────
 
-            needs_update = False
+    def _continue_pan(self, dx, dy):
+        if not self._panning:
+            sz = self._canvas.GetSize()
+            self._cursor_x = sz.x // 2
+            self._cursor_y = sz.y // 2
+            ev = wx.MouseEvent(wx.wxEVT_MIDDLE_DOWN)
+            ev.m_x = self._cursor_x
+            ev.m_y = self._cursor_y
+            ev.m_middleDown = True
+            ev.SetEventObject(self._canvas)
+            self._canvas.GetEventHandler().ProcessEvent(ev)
+            self._panning = True
 
-            if abs(tx) > DEADZONE or abs(ty) > DEADZONE:
-                center = view.GetCenter()
+        if dx == 0 and dy == 0:
+            return
+        self._cursor_x += dx
+        self._cursor_y += dy
 
-                # TX: push right → positive → move view right (board goes left)
-                # TY: push away  → negative → move view up   (board goes down)
-                # Invert TY because screen Y is flipped vs spacenavd Y
-                dx =  tx * PAN_SCALE * 1_000_000   # → nm
-                dy = -ty * PAN_SCALE * 1_000_000   # → nm
+        ev = wx.MouseEvent(wx.wxEVT_MOTION)
+        ev.m_x = self._cursor_x
+        ev.m_y = self._cursor_y
+        ev.m_middleDown = True
+        ev.SetEventObject(self._canvas)
+        self._canvas.GetEventHandler().ProcessEvent(ev)
 
-                new_center = pcbnew.VECTOR2D(
-                    center.x + dx,
-                    center.y + dy
-                )
-                view.SetCenter(new_center)
-                needs_update = True
+    def _end_pan(self):
+        ev = wx.MouseEvent(wx.wxEVT_MIDDLE_UP)
+        ev.m_x = self._cursor_x
+        ev.m_y = self._cursor_y
+        ev.SetEventObject(self._canvas)
+        self._canvas.GetEventHandler().ProcessEvent(ev)
+        self._panning = False
 
-            # ── Translation: TZ → zoom ────────────────────────────────────────
-
-            if abs(tz) > DEADZONE:
-                # TZ positive = push cap down = zoom out
-                # TZ negative = pull cap up   = zoom in
-                scale  = view.GetScale()
-                factor = 1.0 - tz * ZOOM_SCALE
-                factor = max(0.5, min(2.0, factor))   # clamp per-event change
-                view.SetScale(scale * factor)
-                needs_update = True
-
-            if needs_update:
-                pcbnew.CallAfter(frame.GetCanvas().Refresh)
-
-        except Exception as e:
-            # Don't crash the thread on transient API errors
-            pass
-
-
-def _zoom_fit(frame):
-    """Zoom to fit entire board."""
-    try:
-        frame.GetCanvas().GetView().SetScale(1.0)   # reset first
-        frame.ZoomFitBoard()
-    except Exception:
-        pass
+    def _send_wheel(self, notches):
+        sz = self._canvas.GetSize()
+        cx = sz.x // 2
+        cy = sz.y // 2
+        sign = 1 if notches > 0 else -1
+        for _ in range(abs(notches)):
+            ev = wx.MouseEvent(wx.wxEVT_MOUSEWHEEL)
+            ev.m_wheelRotation = sign * 120
+            ev.m_wheelDelta = 120
+            ev.m_x = cx
+            ev.m_y = cy
+            ev.SetEventObject(self._canvas)
+            self._canvas.GetEventHandler().ProcessEvent(ev)
 
 
-def _zoom_fit_selection(frame):
-    """Zoom to fit selection, falling back to full board."""
-    try:
-        board = pcbnew.GetBoard()
-        selected = [i for i in board.GetFootprints() if i.IsSelected()]
-        if selected:
-            frame.ZoomFitSelection()
-        else:
-            frame.ZoomFitBoard()
-    except Exception:
-        pass
+# === Helpers =================================================================
+
+def _find_pcb_canvas():
+    """Returns (canvas, frame) or (None, None) if PCB Editor not open."""
+    frame = None
+    for w in wx.GetTopLevelWindows():
+        if "PCB Editor" in (w.GetTitle() or ""):
+            frame = w
+            break
+    if frame is None:
+        return None, None
+    return _find_glcanvas(frame), frame
 
 
-# ── Module-level singleton ────────────────────────────────────────────────────
-
-_manager = SpaceMouseManager()
+def _find_glcanvas(w):
+    for child in w.GetChildren():
+        if hasattr(child, "GetClassName") and child.GetClassName() == "wxGLCanvas":
+            return child
+        found = _find_glcanvas(child)
+        if found is not None:
+            return found
+    return None
 
 
 def _status(msg):
-    """Print status to KiCad scripting console and stdout."""
     print(f"[SpaceMouse] {msg}")
-    try:
-        # KiCad 9: set the frame status bar text
-        frame = pcbnew.GetCurrentFrame()
-        if frame:
-            frame.SetStatusText(msg, 0)
-    except Exception:
-        pass
 
 
-# ── Auto-start helper (called from startup.py) ────────────────────────────────
+# === Module singleton ========================================================
+
+_manager = _Manager()
+
 
 def auto_start():
-    """
-    Call this from ~/.config/kicad/9.0/scripting/startup.py to
-    start the SpaceMouse listener automatically when KiCad opens.
-
-    Example startup.py:
-        import spacemouse_kicad
-        spacemouse_kicad.auto_start()
-    """
-    ok = _manager.start()
-    if ok:
-        _status("Auto-started successfully")
-    else:
-        _status(f"Auto-start failed — spacenavd socket not found at {SPNAV_SOCK}")
+    """Called from ~/.local/share/kicad/9.0/scripting/startup.py."""
+    ok, reason = _manager.start()
+    _status("Auto-started" if ok else f"Auto-start deferred: {reason}")
