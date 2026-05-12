@@ -1,5 +1,13 @@
-# Give 'input' group rw access to /dev/uinput so the kicad-space3d
-# bridge can run unprivileged. The static_node directive ensures the
-# device node exists even before the uinput module has been triggered
-# by other consumers.
-KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
+# Give the kicad-space3d bridge access to /dev/uinput without requiring
+# a privileged process.
+#
+#   TAG+="uaccess"    — logind applies an ACL granting the currently
+#                       logged-in local seat user rw access. Works
+#                       without any group membership.
+#   GROUP="input"     — kept as a fallback path for the input group,
+#                       in case uaccess isn't applied (e.g. headless,
+#                       non-seat scenarios).
+#   static_node       — ensures /dev/uinput is created at boot even
+#                       if no other consumer has loaded the uinput
+#                       module yet.
+KERNEL=="uinput", TAG+="uaccess", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
