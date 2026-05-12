@@ -7,18 +7,20 @@ canvas via synthesized wx events:
   - TX / TY  → continuous middle-mouse-drag (pan)
   - TZ       → mouse-wheel notches         (zoom)
 
-KiCad 9 stripped the Python wrappers for PCB_EDIT_FRAME, so we can no
-longer call view.SetCenter() / SetScale() from Python. Event synthesis
-into the wxGLCanvas is the only path that works, but the events are
-processed by KiCad's own C++ input handlers — pan/zoom behaviour is
-exactly what real input would produce.
+KiCad 9 stripped the Python wrappers for PCB_EDIT_FRAME, so we synthesize
+input into the wxGLCanvas. KiCad's own C++ handlers respond as if the
+events came from a real mouse.
 
 Threading model:
-  - Reader thread: blocks on spacenavd socket, updates a single shared
-    snapshot under a lock. Never touches wx.
-  - wx.Timer on UI thread: every UI_TICK_MS, reads the snapshot and
-    posts the appropriate events to the canvas. All wx work stays on
-    the UI thread (which is required).
+  - Reader thread: blocks on spacenavd socket, updates a shared snapshot
+    under a lock. Never touches wx.
+  - wx.Timer (owned by the PCB editor frame) fires on the UI thread,
+    reads the snapshot, posts events to the canvas. All wx work stays
+    on the UI thread.
+
+Debug:
+  Set `BISECT_MODE` below to isolate pan or zoom while diagnosing
+  crashes. Per-tick activity is appended to LOG_PATH.
 """
 
 import os
@@ -26,6 +28,7 @@ import socket
 import struct
 import threading
 import time
+import traceback
 
 import wx
 import pcbnew
@@ -35,29 +38,45 @@ import pcbnew
 
 SPNAV_SOCK = "/var/run/spnav.sock"
 
-# Raw axis values are ~int32, typical strong push ≈ ±2000.
-# Anything below this is treated as zero (drift filter).
+# Bisect / debug switches. Set to one of: "both", "pan_only", "zoom_only", "off".
+# When something feels broken, narrow this to isolate the offending path.
+BISECT_MODE = "both"
+
+# Verbose per-tick logging to LOG_PATH (only when there's activity to log).
+LOG_PATH = "/tmp/spacemouse.log"
+LOG_ENABLED = True
+
+# Raw axis values are ~int32; typical strong push ≈ ±2000. Anything below
+# this is treated as zero (drift filter).
 DEADZONE = 600
 
 # Pan scale: spacenavd unit → canvas pixels per UI tick.
-# A strong push (~2000) should give a few tens of pixels per tick.
 PAN_SCALE = 0.02
 
 # Zoom scale: spacenavd unit → wheel notches per UI tick (before clamp).
-# 1 notch ≈ KiCad's per-wheel zoom step (~30%).
 ZOOM_SCALE = 0.0008
 
-# Clamp how many wheel notches we synthesize per tick — prevents wild
-# zoom jumps if the user slams the cap.
+# Cap wheel notches per tick so a hard push doesn't fire a huge burst.
 MAX_WHEEL_NOTCHES_PER_TICK = 3
 
-# UI tick interval (milliseconds). 16 ≈ 60Hz.
-UI_TICK_MS = 16
+# UI tick interval. 33 ≈ 30Hz (deliberately conservative during bring-up).
+UI_TICK_MS = 33
 
-# If we haven't seen a spacenavd event in this long, treat the puck as
-# centered (defensive against the daemon going quiet while the puck is
-# still deflected).
+# Stale check — if no spacenavd event in this long, treat the puck as
+# centered (defensive against the daemon going quiet).
 EVENT_STALE_S = 0.2
+
+
+# === Logger (file-based; KiCad console scrolls and we already prefer files) ==
+
+def _log(msg):
+    if not LOG_ENABLED:
+        return
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(f"{time.time():.3f} {msg}\n")
+    except OSError:
+        pass
 
 
 # === ActionPlugin shell ======================================================
@@ -78,9 +97,6 @@ class SpaceMousePlugin(pcbnew.ActionPlugin):
 # === Manager =================================================================
 
 class _Manager:
-    """
-    Owns the reader thread, the wx UI timer, and the synthetic-drag state.
-    """
 
     def __init__(self):
         # Reader thread state
@@ -88,9 +104,9 @@ class _Manager:
         self._stop_evt = threading.Event()
         self._lock = threading.Lock()
         self._latest = (0, 0, 0, 0)           # tx, ty, tz, buttons
-        self._latest_t = 0.0                  # monotonic time of last update
+        self._latest_t = 0.0
 
-        # UI thread state (only touched on UI thread)
+        # UI thread state
         self._timer = None
         self._canvas = None
         self._frame = None
@@ -122,6 +138,7 @@ class _Manager:
 
         self._canvas = canvas
         self._frame = frame
+        _log(f"START canvas_size={canvas.GetSize().x}x{canvas.GetSize().y} mode={BISECT_MODE}")
 
         # Reader thread
         self._stop_evt.clear()
@@ -130,10 +147,11 @@ class _Manager:
         )
         self._reader_thread.start()
 
-        # UI timer — must be created on UI thread; Run()/auto_start() are
-        # both invoked there.
-        self._timer = wx.Timer()
-        self._timer.Bind(wx.EVT_TIMER, self._on_tick)
+        # Owned timer — Bind on the OWNER so EVT_TIMER actually dispatches.
+        # An unowned wx.Timer() never delivers events; this was the
+        # "no movement" bug in v2.
+        self._timer = wx.Timer(self._frame)
+        self._frame.Bind(wx.EVT_TIMER, self._on_tick, self._timer)
         self._timer.Start(UI_TICK_MS)
 
         self._running = True
@@ -144,13 +162,22 @@ class _Manager:
             return
         self._running = False
         self._stop_evt.set()
+        _log("STOP")
 
-        if self._timer is not None:
-            self._timer.Stop()
-            self._timer = None
+        try:
+            if self._timer is not None:
+                self._timer.Stop()
+                if self._frame is not None:
+                    self._frame.Unbind(wx.EVT_TIMER, source=self._timer)
+                self._timer = None
+        except Exception as e:
+            _log(f"stop: timer cleanup raised {type(e).__name__}: {e}")
 
-        if self._panning:
-            self._end_pan()
+        try:
+            if self._panning:
+                self._end_pan()
+        except Exception as e:
+            _log(f"stop: end_pan raised {type(e).__name__}: {e}")
 
         if self._reader_thread is not None:
             self._reader_thread.join(timeout=1.0)
@@ -164,10 +191,10 @@ class _Manager:
             sock.connect(SPNAV_SOCK)
             sock.settimeout(0.5)
         except OSError as e:
-            print(f"[SpaceMouse] reader connect failed: {e}")
+            _log(f"reader connect failed: {e}")
             return
 
-        print("[SpaceMouse] reader connected")
+        _log("reader connected")
         buf = b""
 
         while not self._stop_evt.is_set():
@@ -189,45 +216,54 @@ class _Manager:
                     self._latest_t = time.monotonic()
 
         sock.close()
-        print("[SpaceMouse] reader disconnected")
+        _log("reader disconnected")
 
     # ── UI tick (UI thread) ──────────────────────────────────────────────────
 
     def _on_tick(self, _evt):
-        # Snapshot the latest puck state under the lock.
+        try:
+            self._tick_inner()
+        except Exception:
+            _log("TICK EXCEPTION:\n" + traceback.format_exc())
+            # Don't let a bad event tear down the timer — but if this keeps
+            # happening, BISECT_MODE will help isolate.
+
+    def _tick_inner(self):
         with self._lock:
             tx, ty, tz, _buttons = self._latest
             age = time.monotonic() - self._latest_t
 
-        # Stale → treat as centered.
         if age > EVENT_STALE_S:
             tx = ty = tz = 0
 
-        # Deadzone.
         if abs(tx) < DEADZONE: tx = 0
         if abs(ty) < DEADZONE: ty = 0
         if abs(tz) < DEADZONE: tz = 0
 
-        # If the canvas has been destroyed (e.g. PCB editor closed) bail.
+        # Canvas might have been destroyed (PCB editor closed).
         if self._canvas is None or not self._canvas:
+            _log("tick: canvas gone, stopping")
             self.stop()
             return
 
-        # ── Pan via middle-drag state machine ──
-        if tx or ty:
-            dx = int(tx * PAN_SCALE)
-            dy = int(-ty * PAN_SCALE)   # invert: pushing puck forward pans up
-            self._continue_pan(dx, dy)
-        elif self._panning:
-            self._end_pan()
+        # Pan
+        if BISECT_MODE in ("both", "pan_only"):
+            if tx or ty:
+                dx = int(tx * PAN_SCALE)
+                dy = int(-ty * PAN_SCALE)
+                self._continue_pan(dx, dy)
+            elif self._panning:
+                self._end_pan()
 
-        # ── Zoom via wheel notches ──
-        if tz:
-            # Pull cap up (tz < 0) → zoom in (positive wheel rotation).
+        # Zoom — but never while a pan drag is open, to avoid confusing
+        # KiCad's tool dispatcher with overlapping inputs. End pan first.
+        if BISECT_MODE in ("both", "zoom_only") and tz:
             notches = int(-tz * ZOOM_SCALE)
             notches = max(-MAX_WHEEL_NOTCHES_PER_TICK,
                           min(MAX_WHEEL_NOTCHES_PER_TICK, notches))
             if notches:
+                if self._panning:
+                    self._end_pan()
                 self._send_wheel(notches)
 
     # ── Synthetic events ─────────────────────────────────────────────────────
@@ -242,7 +278,8 @@ class _Manager:
             ev.m_y = self._cursor_y
             ev.m_middleDown = True
             ev.SetEventObject(self._canvas)
-            self._canvas.GetEventHandler().ProcessEvent(ev)
+            ok = self._canvas.GetEventHandler().ProcessEvent(ev)
+            _log(f"MIDDLE_DOWN at ({self._cursor_x},{self._cursor_y}) handled={ok}")
             self._panning = True
 
         if dx == 0 and dy == 0:
@@ -262,7 +299,8 @@ class _Manager:
         ev.m_x = self._cursor_x
         ev.m_y = self._cursor_y
         ev.SetEventObject(self._canvas)
-        self._canvas.GetEventHandler().ProcessEvent(ev)
+        ok = self._canvas.GetEventHandler().ProcessEvent(ev)
+        _log(f"MIDDLE_UP at ({self._cursor_x},{self._cursor_y}) handled={ok}")
         self._panning = False
 
     def _send_wheel(self, notches):
@@ -278,6 +316,7 @@ class _Manager:
             ev.m_y = cy
             ev.SetEventObject(self._canvas)
             self._canvas.GetEventHandler().ProcessEvent(ev)
+        _log(f"WHEEL notches={notches}")
 
 
 # === Helpers =================================================================
@@ -306,6 +345,7 @@ def _find_glcanvas(w):
 
 def _status(msg):
     print(f"[SpaceMouse] {msg}")
+    _log(f"STATUS {msg}")
 
 
 # === Module singleton ========================================================
@@ -314,6 +354,5 @@ _manager = _Manager()
 
 
 def auto_start():
-    """Called from ~/.local/share/kicad/9.0/scripting/startup.py."""
     ok, reason = _manager.start()
     _status("Auto-started" if ok else f"Auto-start deferred: {reason}")
