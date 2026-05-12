@@ -1,0 +1,16 @@
+[Unit]
+Description=KiCad SpaceMouse Bridge (spacenavd -> uinput)
+Documentation=https://github.com/pann/kicad-space3d
+# spacenavd is a system service; user units can't depend on it directly,
+# but bridge.py will retry/exit cleanly if the socket isn't ready.
+
+[Service]
+Type=simple
+ExecStart=%h/work/git/kicad-space3d/bridge/bridge.py
+Restart=on-failure
+RestartSec=2
+# Inherit DISPLAY / WAYLAND_DISPLAY from the user session so xdotool works.
+PassEnvironment=DISPLAY WAYLAND_DISPLAY XAUTHORITY
+
+[Install]
+WantedBy=default.target

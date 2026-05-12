@@ -1,0 +1,5 @@
+# Give 'input' group rw access to /dev/uinput so the kicad-space3d
+# bridge can run unprivileged. The static_node directive ensures the
+# device node exists even before the uinput module has been triggered
+# by other consumers.
+KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
