@@ -137,15 +137,26 @@ def main():
         f"pan_scale={PAN_SCALE} zoom_scale={ZOOM_SCALE} "
         f"invert_x={PAN_X_INVERT} invert_y={PAN_Y_INVERT}")
 
-    kc = KiCad()
-    log(f"connected to KiCad API (KiCad {kc.get_version()}, "
-        f"API {kc.get_api_version()})")
+    kc = None
+    doc = None
 
-    doc = get_pcb_document(kc)
-    if doc is not None:
-        log(f"PCB document: {doc.board_filename}")
-    else:
-        log("WARNING: no PCB document open at startup; will retry per event")
+    def reconnect():
+        nonlocal kc, doc
+        try:
+            kc = KiCad()
+            log(f"connected to KiCad API (KiCad {kc.get_version()}, "
+                f"API {kc.get_api_version()})")
+            doc = get_pcb_document(kc)
+            if doc is not None:
+                log(f"PCB document: {doc.board_filename}")
+            else:
+                log("WARNING: no PCB document open; will retry per event")
+        except Exception as err:
+            log(f"KiCad connection failed: {err}; will retry")
+            kc = None
+            doc = None
+
+    reconnect()
 
     sock = connect_spnav()
     buf = b""
@@ -178,6 +189,11 @@ def main():
                 if not is_target_focused():
                     continue
 
+                if kc is None:
+                    reconnect()
+                if kc is None:
+                    continue
+
                 if doc is None:
                     doc = get_pcb_document(kc)
                 if doc is None:
@@ -198,16 +214,16 @@ def main():
                     except ApiError as err:
                         if DEBUG:
                             log(f"pan_view failed: {err}")
-                        doc = None
+                        kc = doc = None
 
-                if tz:
+                if tz and kc is not None:
                     factor = 1.0 + (-tz) * ZOOM_SCALE
                     try:
                         kc.zoom_view(doc, factor)
                     except ApiError as err:
                         if DEBUG:
                             log(f"zoom_view failed: {err}")
-                        doc = None
+                        kc = doc = None
 
     except KeyboardInterrupt:
         log("interrupted")
