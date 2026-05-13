@@ -169,9 +169,14 @@ def main():
             except socket.timeout:
                 pass
 
-            while len(buf) >= 8:
-                pkt, buf = buf[:8], buf[8:]
-                event_type, button = struct.unpack("<2i", pkt)
+            while len(buf) >= 32:
+                pkt, buf = buf[:32], buf[32:]
+                # All spnav events are 32 bytes (sizeof union spnav_event).
+                # Motion (type=1): TX TY TZ RX RY RZ period — 7 ints of payload.
+                # Button (type=2): bnum — 1 int of payload, rest zero padding.
+                # Reading 8 bytes at a time split motion packets and caused TY/TZ
+                # values to be misread as button events.
+                event_type, button = struct.unpack_from("<2i", pkt)
 
                 if event_type != 2:
                     continue
