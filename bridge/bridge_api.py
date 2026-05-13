@@ -116,6 +116,17 @@ def get_pcb_document(kc):
         return None
 
 
+# === KiCad socket watcher ===================================================
+
+_KICAD_API_SOCK = os.environ.get("KICAD_API_SOCKET", "/tmp/kicad/api.sock")
+
+def _socket_inode():
+    try:
+        return os.stat(_KICAD_API_SOCK).st_ino
+    except OSError:
+        return None
+
+
 # === spacenavd reader =======================================================
 
 def connect_spnav():
@@ -157,6 +168,7 @@ def main():
             doc = None
 
     reconnect()
+    _last_inode = _socket_inode()
 
     sock = connect_spnav()
     buf = b""
@@ -170,29 +182,15 @@ def main():
                     break
                 buf += chunk
             except socket.timeout:
+                # Check if the KiCad API socket was replaced (inode change =
+                # KiCad restarted). ZMQ reconnects silently so ApiError never
+                # fires; inode polling is the only reliable signal.
+                cur = _socket_inode()
+                if cur is not None and cur != _last_inode:
+                    log("KiCad socket replaced — reconnecting")
+                    _last_inode = cur
+                    kc = doc = None
                 continue
-
-            # Discard all but the latest complete packet to avoid replaying
-            # stale events that built up while KiCad was busy.
-            if len(buf) >= 32:
-                n = (len(buf) // 32) * 32
-                buf = buf[n - 32:]
-
-            while len(buf) >= 32:
-                packet, buf = buf[:32], buf[32:]
-                vals = struct.unpack("<8i", packet)
-                tx, ty, tz = vals[1], vals[3], vals[2]
-
-                if DEBUG and any(v != 0 for v in vals):
-                    log(f"raw tx={tx} ty={ty} tz={tz}")
-
-                if not is_target_focused():
-                    continue
-
-                if kc is None:
-                    reconnect()
-                if kc is None:
-                    continue
 
                 if doc is None:
                     doc = get_pcb_document(kc)
