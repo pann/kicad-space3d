@@ -198,6 +198,7 @@ def main():
                     except ApiError as err:
                         if DEBUG:
                             log(f"pan_view failed: {err}")
+                        doc = None
 
                 if tz:
                     factor = 1.0 + (-tz) * ZOOM_SCALE
@@ -206,6 +207,7 @@ def main():
                     except ApiError as err:
                         if DEBUG:
                             log(f"zoom_view failed: {err}")
+                        doc = None
 
     except KeyboardInterrupt:
         log("interrupted")
