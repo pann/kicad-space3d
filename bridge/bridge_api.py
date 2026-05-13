@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """
-kicad-space3d IPC bridge: spacenavd → KiCad IPC PanView / ZoomView
+kicad-space3d button bridge: spacenavd → xdotool key injection
 
-Pan and zoom go directly through the KiCad API — no uinput, no modifier keys,
-no synthetic wheel events.  Normal mouse scroll is completely unaffected.
+KiCad's native SpaceMouse support handles pan/zoom/rotate. This bridge maps
+SpaceMouse buttons to keyboard shortcuts via xdotool, with separate maps for
+the PCB Editor and 3D Viewer.
 
-Requirements:
-  - KiCad built with IPC pan/zoom support (PanView / ZoomView commands)
-  - kicad-python (kipy) installed in this venv
-  - spacenavd running
-  - "Enable KiCad API" turned on in KiCad preferences
+Button numbers are 1-based (1–15 for a 15-button device). Button 0 is the
+release sentinel and cannot be mapped.
+
+Modifier keys (shift, ctrl, alt) are held via keydown on press and released
+via keyup when the physical button is released (vals[1]==0). They remain held
+in the X server, so mouse clicks and other keys see the modifier active.
+
+Configuration (env vars):
+  KS3D_PCB_BUTTONS   Comma-separated button:key for PCB Editor
+  KS3D_3D_BUTTONS    Comma-separated button:key for 3D Viewer
+  SPNAV_SOCK         Path to spacenavd socket (default: /var/run/spnav.sock)
+  KS3D_FOCUS_CACHE_S Focus check cache in seconds (default: 0.3)
+  KS3D_DEBUG         Set to 1 for verbose logging
 """
 
-import argparse
 import os
 import socket
 import struct
@@ -20,118 +28,119 @@ import subprocess
 import sys
 import time
 
-try:
-    from kipy import KiCad
-    from kipy.errors import ApiError
-    from kipy.proto.common.types import DocumentType
-except ImportError:
-    sys.stderr.write("ERROR: kicad-python missing. Install in bridge/.venv:\n"
-                     "  bridge/.venv/bin/pip install -e ~/work/git/kicad-python\n")
-    sys.exit(1)
+SPNAV_SOCK     = os.environ.get("SPNAV_SOCK", "/var/run/spnav.sock")
+DEBUG          = os.environ.get("KS3D_DEBUG", "0") == "1"
+FOCUS_CACHE_S  = float(os.environ.get("KS3D_FOCUS_CACHE_S", "0.3"))
+
+# Keys that should be held (keydown on press, keyup on release)
+HOLD_KEYS = {"shift", "ctrl", "alt", "super", "meta"}
+
+# Default maps — override with KS3D_PCB_BUTTONS / KS3D_3D_BUTTONS env vars.
+# NOTE: button 0 (release sentinel) cannot be mapped.
+_DEFAULT_PCB = (
+    "6:Escape,"
+    "8:shift,"
+    "9:ctrl,"
+    "7:alt,"
+    "1:Prior,"        # PgUp  — Top Cu active
+    # button 0 (PgDn / Bottom Cu) is the release sentinel — not mappable
+    "13:ctrl+plus,"   # up one layer
+    "12:ctrl+minus,"  # down one layer
+    "10:Home,"        # zoom fit board
+    "11:f"            # zoom selection
+)
+_DEFAULT_3D = (
+    "2:z,"            # top view
+    "3:shift+x,"      # left view
+    "4:x,"            # right view
+    "5:shift+z,"      # bottom view
+    "14:ctrl+r,"      # toggle ray-tracing
+    "10:Home"         # fit view
+)
 
 
-# === Tuning =================================================================
-
-def _f(name, default):
-    try: return float(os.environ.get(name, default))
-    except ValueError: return default
-
-def _i(name, default):
-    try: return int(os.environ.get(name, default))
-    except ValueError: return default
-
-SPNAV_SOCK = os.environ.get("SPNAV_SOCK", "/var/run/spnav.sock")
-
-PAN_DEADZONE    = _i("KS3D_PAN_DEADZONE", 5)
-PAN_XY_DEADZONE = _i("KS3D_PAN_XY_DEADZONE", 20)  # combined magnitude gate
-ZOOM_DEADZONE   = _i("KS3D_ZOOM_DEADZONE", 25)
-
-# spacenavd unit → viewport fraction per event (0.0002 ≈ 0.02% of visible area)
-PAN_SCALE  = _f("KS3D_PAN_SCALE", 0.0002)
-# factor = 1.0 + tz * ZOOM_SCALE  (0.00003 × 100 units ≈ 0.3% zoom per event)
-ZOOM_SCALE = _f("KS3D_ZOOM_SCALE", 0.00003)
-
-def _parse_args():
-    p = argparse.ArgumentParser(description="kicad-space3d IPC bridge")
-    p.add_argument("--invert-x", action=argparse.BooleanOptionalAction,
-                   default=os.environ.get("KS3D_PAN_X_INVERT", "0") == "1",
-                   help="invert X pan direction (default: on)")
-    p.add_argument("--invert-y", action=argparse.BooleanOptionalAction,
-                   default=os.environ.get("KS3D_PAN_Y_INVERT", "1") == "1",
-                   help="invert Y pan direction (default: on)")
-    return p.parse_args()
-
-_ARGS = _parse_args()
-PAN_X_INVERT  = _ARGS.invert_x
-PAN_Y_INVERT  = _ARGS.invert_y
-
-TARGET_WINDOW_SUBSTRINGS = os.environ.get(
-    "KS3D_TARGETS", "PCB Editor"
-).split("|")
-FOCUS_CACHE_S = _f("KS3D_FOCUS_CACHE_S", 0.3)
-
-DEBUG = os.environ.get("KS3D_DEBUG", "0") == "1"
+def _parse_map(env_var, default):
+    raw = os.environ.get(env_var, default)
+    mapping = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if ":" not in item:
+            continue
+        btn, key = item.split(":", 1)
+        try:
+            mapping[int(btn.strip())] = key.strip()
+        except ValueError:
+            pass
+    return mapping
 
 
-# === Logging ================================================================
+PCB_MAP    = _parse_map("KS3D_PCB_BUTTONS", _DEFAULT_PCB)
+VIEWER_MAP = _parse_map("KS3D_3D_BUTTONS", _DEFAULT_3D)
+
 
 def log(msg):
-    sys.stderr.write(f"[ks3d-ipc] {msg}\n")
+    sys.stderr.write(f"[ks3d] {msg}\n")
     sys.stderr.flush()
 
 
-# === Focus check ============================================================
+# === Focus / context detection ==============================================
 
-class _Focus:
+class _FocusCache:
     last_t = 0.0
-    last_focused = False
+    last_context = None  # "pcb", "3d", or None
+    last_wid = None
 
-def is_target_focused():
+
+def get_context():
+    """Return (context, window_id) for the active window, cached."""
     now = time.monotonic()
-    if now - _Focus.last_t < FOCUS_CACHE_S:
-        return _Focus.last_focused
+    if now - _FocusCache.last_t < FOCUS_CACHE_S:
+        return _FocusCache.last_context, _FocusCache.last_wid
+
     try:
         r = subprocess.run(
-            ["xdotool", "getactivewindow", "getwindowname"],
+            ["xdotool", "getactivewindow"],
             capture_output=True, text=True, timeout=0.5,
         )
-        title = (r.stdout or "").strip()
-    except (subprocess.SubprocessError, FileNotFoundError, OSError):
-        title = ""
-    _Focus.last_focused = any(s in title for s in TARGET_WINDOW_SUBSTRINGS)
-    _Focus.last_t = now
+        wid = int(r.stdout.strip())
+        r2 = subprocess.run(
+            ["xdotool", "getwindowname", str(wid)],
+            capture_output=True, text=True, timeout=0.5,
+        )
+        title = r2.stdout.strip()
+    except (subprocess.SubprocessError, FileNotFoundError, OSError, ValueError):
+        wid, title = None, ""
+
+    if "3D Viewer" in title:
+        ctx = "3d"
+    elif "PCB Editor" in title:
+        ctx = "pcb"
+    else:
+        ctx = None
+
+    _FocusCache.last_context = ctx
+    _FocusCache.last_wid = wid
+    _FocusCache.last_t = now
     if DEBUG:
-        log(f"focus: title={title!r} -> {_Focus.last_focused}")
-    return _Focus.last_focused
+        log(f"focus: {title!r} wid={wid} -> {ctx}")
+    return ctx, wid
 
 
-# === Document resolver ======================================================
+# === Key injection ==========================================================
 
-def get_pcb_document(kc):
-    """Return the first open PCB document, or None if no board is open."""
+def xdo(*args):
     try:
-        docs = kc.get_open_documents(DocumentType.DOCTYPE_PCB)
-        return docs[0] if docs else None
-    except ApiError:
-        return None
-
-
-# === KiCad socket watcher ===================================================
-
-_KICAD_API_SOCK = os.environ.get("KICAD_API_SOCKET", "/tmp/kicad/api.sock")
-
-def _socket_inode():
-    try:
-        return os.stat(_KICAD_API_SOCK).st_ino
-    except OSError:
-        return None
+        subprocess.run(["xdotool"] + list(args), timeout=0.5)
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as err:
+        if DEBUG:
+            log(f"xdotool {args} failed: {err}")
 
 
 # === spacenavd reader =======================================================
 
 def connect_spnav():
     if not os.path.exists(SPNAV_SOCK):
-        log(f"spacenavd socket missing at {SPNAV_SOCK}.")
+        log(f"spacenavd socket missing at {SPNAV_SOCK}")
         sys.exit(3)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.connect(SPNAV_SOCK)
@@ -143,35 +152,11 @@ def connect_spnav():
 # === Main ===================================================================
 
 def main():
-    log(f"targets={TARGET_WINDOW_SUBSTRINGS} "
-        f"pan_dz={PAN_DEADZONE} pan_xy_dz={PAN_XY_DEADZONE} zoom_dz={ZOOM_DEADZONE} "
-        f"pan_scale={PAN_SCALE} zoom_scale={ZOOM_SCALE} "
-        f"invert_x={PAN_X_INVERT} invert_y={PAN_Y_INVERT}")
-
-    kc = None
-    doc = None
-
-    def reconnect():
-        nonlocal kc, doc
-        try:
-            kc = KiCad()
-            log(f"connected to KiCad API (KiCad {kc.get_version()}, "
-                f"API {kc.get_api_version()})")
-            doc = get_pcb_document(kc)
-            if doc is not None:
-                log(f"PCB document: {doc.board_filename}")
-            else:
-                log("WARNING: no PCB document open; will retry per event")
-        except Exception as err:
-            log(f"KiCad connection failed: {err}; will retry")
-            kc = None
-            doc = None
-
-    reconnect()
-    _last_inode = _socket_inode()
+    log(f"pcb={PCB_MAP}  3d={VIEWER_MAP}")
 
     sock = connect_spnav()
     buf = b""
+    held_modifiers = {}  # key -> wid it was sent to
 
     try:
         while True:
@@ -182,52 +167,53 @@ def main():
                     break
                 buf += chunk
             except socket.timeout:
-                # Check if the KiCad API socket was replaced (inode change =
-                # KiCad restarted). ZMQ reconnects silently so ApiError never
-                # fires; inode polling is the only reliable signal.
-                cur = _socket_inode()
-                if cur is not None and cur != _last_inode:
-                    log("KiCad socket replaced — reconnecting")
-                    _last_inode = cur
-                    kc = doc = None
-                continue
+                pass
 
-                if doc is None:
-                    doc = get_pcb_document(kc)
-                if doc is None:
+            while len(buf) >= 8:
+                pkt, buf = buf[:8], buf[8:]
+                event_type, button = struct.unpack("<2i", pkt)
+
+                if event_type != 2:
                     continue
 
-                if abs(tx) < PAN_DEADZONE:  tx = 0
-                if abs(ty) < PAN_DEADZONE:  ty = 0
-                if tx*tx + ty*ty < PAN_XY_DEADZONE*PAN_XY_DEADZONE: tx = ty = 0
-                if abs(tz) < ZOOM_DEADZONE: tz = 0
-
-                if tx or ty:
-                    dx = tx * PAN_SCALE * (-1 if PAN_X_INVERT else 1)
-                    dy = ty * PAN_SCALE * (-1 if PAN_Y_INVERT else 1)
-                    if DEBUG:
-                        log(f"pan_view dx={dx:.5f} dy={dy:.5f}")
-                    try:
-                        kc.pan_view(doc, dx, dy)
-                    except ApiError as err:
+                if button:  # press — button number 1-15
+                    ctx, wid = get_context()
+                    bmap = PCB_MAP if ctx == "pcb" else VIEWER_MAP if ctx == "3d" else {}
+                    key = bmap.get(button)
+                    if key is None:
                         if DEBUG:
-                            log(f"pan_view failed: {err}")
-                        kc = doc = None
+                            log(f"button {button} (unmapped, ctx={ctx})")
+                        continue
 
-                if tz and kc is not None:
-                    factor = 1.0 + (-tz) * ZOOM_SCALE
-                    try:
-                        kc.zoom_view(doc, factor)
-                    except ApiError as err:
+                    w = ["--window", str(wid)] if wid else []
+                    if key.lower() in HOLD_KEYS:
+                        xdo("keydown", *w, key)
+                        held_modifiers[key] = wid
                         if DEBUG:
-                            log(f"zoom_view failed: {err}")
-                        kc = doc = None
+                            log(f"button {button} keydown {key} wid={wid}")
+                    else:
+                        xdo("key", *w, key)
+                        if DEBUG:
+                            log(f"button {button} key {key} wid={wid}")
+
+                else:  # release (vals[1] == 0)
+                    for key, wid in list(held_modifiers.items()):
+                        w = ["--window", str(wid)] if wid else []
+                        xdo("keyup", *w, key)
+                        if DEBUG:
+                            log(f"keyup {key} wid={wid}")
+                    held_modifiers.clear()
 
     except KeyboardInterrupt:
         log("interrupted")
     finally:
-        try: sock.close()
-        except Exception: pass
+        for key, wid in list(held_modifiers.items()):
+            w = ["--window", str(wid)] if wid else []
+            xdo("keyup", *w, key)
+        try:
+            sock.close()
+        except Exception:
+            pass
         log("clean shutdown")
 
 
